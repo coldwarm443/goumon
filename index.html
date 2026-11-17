@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Animated Image + Lightning Grunge + Multi-Layer Audio</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: #0e0e11;
+      color: #eaeaf0;
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      gap: 1rem;
+      padding: 2rem;
+    }
+
+    /* ▼ 画像・静止画転写Canvas・稲妻Canvasを重ねるコンテナ */
+    .lightning-media-box {
+      position: relative;
+      display: inline-block;
+      max-width: 720px;
+      width: 100%;
+      overflow: hidden;
+      cursor: pointer;
+      user-select: none;
+      border: 1px solid #2a2a32;
+      background-color: #000;
+    }
+
+    /* 第1層：元のGIF / アニメーションWebP */
+    .lightning-media-box img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    /* 第2層：停止時のコマを焼き付けて表示する静止画Canvas */
+    .lightning-media-box .freeze-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    /* 停止中は第2層を表示して下のGIF/WebPの動きを隠す */
+    .lightning-media-box.is-paused .freeze-canvas {
+      display: block;
+    }
+
+    /* 第3層：稲妻・静電気・粒子ノイズを描画するグランジCanvas */
+    .lightning-media-box .grunge-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 2;
+      mix-blend-mode: screen;
+    }
+
+    /* 状態確認用バッジ */
+    .status-badge {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      z-index: 3;
+      padding: 4px 10px;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      background: rgba(10, 10, 14, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      color: #fff;
+      pointer-events: none;
+    }
+
+    /* ▼ 再生・停止コントロールボタン */
+    .controls {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .controls button {
+      padding: 0.65rem 1.4rem;
+      font-size: 13px;
+      letter-spacing: 0.1em;
+      color: #eaeaf0;
+      background: #18181f;
+      border: 1px solid #3a3a46;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .controls button:hover {
+      background: #262632;
+      border-color: #7a8ba8;
+    }
+
+    .controls button:active {
+      transform: translateY(1px);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ▼ 画像＆オーバーレイ本体（画像クリックでも再生・音声重ねが可能） -->
+  <div class="lightning-media-box" id="media-box">
+    <img src="tsuyoshi.webp" alt="☆草彅剛☆" />
+    <!-- loopを外すと1回再生ごとに終了、付けるとループしながら音が重なります -->
+    <audio src="sound.mp3" loop preload="auto"></audio>
+    <canvas class="freeze-canvas"></canvas>
+    <canvas class="grunge-canvas"></canvas>
+    <div class="status-badge">ACTIVE / SOUND x0</div>
+  </div>
+
+  <!-- ▼ 操作ボタン -->
+  <div class="controls">
+    <button type="button" id="btn-play">▶ 再生（音声を重ねる）</button>
+    <button type="button" id="btn-stop">■ 停止（電流を消す）</button>
+  </div>
+
+  <script>
+    (() => {
+      // ▼ 演出の調整用パラメータ
+      const CONFIG = {
+        fps: 24,                    // 稲妻ノイズのフレームレート
+        grainOpacity: 0.12,         // 粒子ノイズの濃さ (0.0 〜 1.0)
+        boltSpawnChance: 18.3,       // 新しい稲妻が発生する確率
+        maxBolts: 100,                // 同時に発生できる稲妻の最大数
+        jaggedness: 225,             // ジグザグの振れ幅
+        branchChance: 0.35,         // 枝分かれ確率
+        coreColor: '255, 255, 255', // 稲妻の芯の色 (RGB)
+        glowColor: '170, 210, 255', // 稲妻の発光色 (RGB)
+        flashIntensity: 0.16,       // 発生瞬間の閃光の強さ
+        sparkCount: 21,             // 静電気スパークの数
+        audioVolume: 0.5            // 1音あたりの音量 (0.0 〜 1.0)
+      };
+
+      // 粒子ノイズタイルを事前生成
+      const noiseTileSize = 256;
+      const noiseCanvas = document.createElement('canvas');
+      noiseCanvas.width = noiseTileSize;
+      noiseCanvas.height = noiseTileSize;
+      const noiseCtx = noiseCanvas.getContext('2d');
+
+      (function generateNoiseTile() {
+        const imgData = noiseCtx.createImageData(noiseTileSize, noiseTileSize);
+        const buffer = new Uint32Array(imgData.data.buffer);
+        for (let i = 0; i < buffer.length; i++) {
+          const isBright = Math.random() < 0.25;
+          const val = isBright ? 255 : (Math.random() * 80) | 0;
+          const alpha = (isBright ? Math.random() * 255 : Math.random() * 120) * CONFIG.grainOpacity | 0;
+          buffer[i] = (alpha << 24) | (val << 16) | (val << 8) | val;
+        }
+        noiseCtx.putImageData(imgData, 0, 0);
+      })();
+
+      const container = document.getElementById('media-box');
+      const img = container.querySelector('img');
+      const baseAudio = container.querySelector('audio');
+      const freezeCanvas = container.querySelector('.freeze-canvas');
+      const freezeCtx = freezeCanvas.getContext('2d');
+      const grungeCanvas = container.querySelector('.grunge-canvas');
+      const grungeCtx = grungeCanvas.getContext('2d');
+      const badge = container.querySelector('.status-badge');
+
+      const btnPlay = document.getElementById('btn-play');
+      const btnStop = document.getElementById('btn-stop');
+
+      let isPlaying = true;
+      let width = 0;
+      let height = 0;
+      let lastFrameTime = 0;
+      const frameInterval = 1000 / CONFIG.fps;
+      const activeBolts = [];
+
+      // 重ねて再生中のAudioインスタンスを管理する配列
+      const activeAudios = [];
+
+      function updateBadge() {
+        if (!badge) return;
+        if (!isPlaying) {
+          badge.textContent = 'STOPPED';
+        } else {
+          badge.textContent = `PLAYING / SOUND x${activeAudios.length}`;
+        }
+      }
+
+      // ▼ 新たに再生（画像・電流の再開 ＋ 音声を新規作成して重ねて再生）
+      function triggerPlayAndLayerSound() {
+        // 停止中だった場合は画像と電流のアニメーションを再開
+        if (!isPlaying) {
+          isPlaying = true;
+          container.classList.remove('is-paused');
+          lastFrameTime = performance.now();
+        }
+
+        // 新しいAudioインスタンスを生成して頭から再生（既存の音は止めずに重ねる）
+        const audioSrc = baseAudio ? baseAudio.getAttribute('src') : null;
+        if (audioSrc) {
+          const sound = new Audio(audioSrc);
+          sound.volume = CONFIG.audioVolume;
+          sound.loop = baseAudio.loop;
+
+          // 再生終了時に配列から自動削除
+          sound.addEventListener('ended', () => {
+            const idx = activeAudios.indexOf(sound);
+            if (idx > -1) activeAudios.splice(idx, 1);
+            updateBadge();
+          });
+
+          activeAudios.push(sound);
+          sound.play().catch(() => {
+            const idx = activeAudios.indexOf(sound);
+            if (idx > -1) activeAudios.splice(idx, 1);
+            updateBadge();
+          });
+        }
+
+        updateBadge();
+      }
+
+      // ▼ 停止（画像静止 ＋ 電流を完全消去 ＋ すべての重なった音声を停止）
+      function triggerStop() {
+        if (img.complete && img.naturalWidth > 0) {
+          freezeCanvas.width = img.naturalWidth;
+          freezeCanvas.height = img.naturalHeight;
+          freezeCtx.drawImage(img, 0, 0, freezeCanvas.width, freezeCanvas.height);
+          container.classList.add('is-paused');
+        }
+
+        isPlaying = false;
+
+        // 電流（稲妻データとCanvas描画）を完全に消す
+        activeBolts.length = 0;
+        grungeCtx.clearRect(0, 0, width, height);
+
+        // 重ねて鳴らしていたすべての音声を停止・破棄
+        for (const sound of activeAudios) {
+          sound.pause();
+          sound.currentTime = 0;
+        }
+        activeAudios.length = 0;
+
+        updateBadge();
+      }
+
+      // イベント登録（画像クリック or 再生ボタンで重ね再生、停止ボタンで全停止）
+      container.addEventListener('click', triggerPlayAndLayerSound);
+      btnPlay.addEventListener('click', triggerPlayAndLayerSound);
+      btnStop.addEventListener('click', triggerStop);
+
+      // 画像の表示サイズ変化に合わせて稲妻Canvasの解像度を同期
+      const resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          width = grungeCanvas.width = Math.round(entry.contentRect.width);
+          height = grungeCanvas.height = Math.round(entry.contentRect.height);
+        }
+      });
+      resizeObserver.observe(container);
+
+      function drawGrain() {
+        grungeCtx.save();
+        const offsetX = -(Math.random() * noiseTileSize);
+        const offsetY = -(Math.random() * noiseTileSize);
+        const flipX = Math.random() < 0.5 ? 1 : -1;
+        const flipY = Math.random() < 0.5 ? 1 : -1;
+
+        grungeCtx.scale(flipX, flipY);
+        const startX = flipX === 1 ? offsetX : -width + offsetX;
+        const startY = flipY === 1 ? offsetY : -height + offsetY;
+
+        for (let x = startX; x < width + noiseTileSize; x += noiseTileSize) {
+          for (let y = startY; y < height + noiseTileSize; y += noiseTileSize) {
+            grungeCtx.drawImage(noiseCanvas, x, y);
+          }
+        }
+        grungeCtx.restore();
+      }
+
+      function buildLightningSegments(x1, y1, x2, y2, displace, segments, isBranch = false, depth = 0) {
+        if (displace < 3 || depth > 6) {
+          segments.push({ x1, y1, x2, y2, isBranch });
+          return;
+        }
+
+        const midX = (x1 + x2) * 0.5 + (Math.random() - 0.5) * displace;
+        const midY = (y1 + y2) * 0.5 + (Math.random() - 0.5) * displace;
+
+        if (!isBranch && depth >= 1 && depth <= 3 && Math.random() < CONFIG.branchChance) {
+          const dx = x2 - midX;
+          const dy = y2 - midY;
+          const len = Math.hypot(dx, dy) * (0.45 + Math.random() * 0.35);
+          const baseAngle = Math.atan2(dy, dx);
+          const branchAngle = baseAngle + (Math.random() < 0.5 ? 1 : -1) * (0.35 + Math.random() * 0.55);
+
+          const bx2 = midX + Math.cos(branchAngle) * len;
+          const by2 = midY + Math.sin(branchAngle) * len;
+
+          buildLightningSegments(midX, midY, bx2, by2, displace * 0.55, segments, true, depth + 1);
+        }
+
+        buildLightningSegments(x1, y1, midX, midY, displace * 0.52, segments, isBranch, depth + 1);
+        buildLightningSegments(midX, midY, x2, y2, displace * 0.52, segments, isBranch, depth + 1);
+      }
+
+      function spawnLightningBolt() {
+        const startFromTop = Math.random() < 0.7;
+        const x1 = Math.random() * width;
+        const y1 = startFromTop ? -5 : Math.random() * height * 0.5;
+
+        const angleSpread = (Math.random() - 0.5) * width * 0.6;
+        const x2 = Math.max(0, Math.min(width, x1 + angleSpread));
+        const y2 = startFromTop
+          ? height * (0.4 + Math.random() * 0.65)
+          : height + 5;
+
+        const segments = [];
+        buildLightningSegments(x1, y1, x2, y2, CONFIG.jaggedness, segments, false, 0);
+
+        activeBolts.push({
+          segments,
+          age: 0,
+          maxLife: Math.floor(2 + Math.random() * 4),
+          baseWidth: 1.0 + Math.random() * 1.1
+        });
+      }
+
+      function updateAndDrawLightning() {
+        if (activeBolts.length < CONFIG.maxBolts && Math.random() < CONFIG.boltSpawnChance) {
+          spawnLightningBolt();
+        }
+
+        let triggeredFlash = false;
+
+        for (let i = activeBolts.length - 1; i >= 0; i--) {
+          const bolt = activeBolts[i];
+          const progress = bolt.age / bolt.maxLife;
+          const alpha = Math.pow(1 - progress, 1.5);
+
+          if (bolt.age === 0) triggeredFlash = true;
+
+          const isFlickerSkip = bolt.age > 0 && Math.random() < 0.25;
+
+          if (!isFlickerSkip) {
+            grungeCtx.save();
+            grungeCtx.lineCap = 'butt';
+            grungeCtx.lineJoin = 'miter';
+
+            // 発光グロー
+            grungeCtx.beginPath();
+            for (const seg of bolt.segments) {
+              grungeCtx.moveTo(seg.x1, seg.y1);
+              grungeCtx.lineTo(seg.x2, seg.y2);
+            }
+            grungeCtx.strokeStyle = `rgba(${CONFIG.glowColor}, ${alpha * 0.35})`;
+            grungeCtx.lineWidth = bolt.baseWidth * 3.6;
+            grungeCtx.stroke();
+
+            // メイン芯
+            grungeCtx.beginPath();
+            for (const seg of bolt.segments) {
+              if (!seg.isBranch) {
+                grungeCtx.moveTo(seg.x1, seg.y1);
+                grungeCtx.lineTo(seg.x2, seg.y2);
+              }
+            }
+            grungeCtx.strokeStyle = `rgba(${CONFIG.coreColor}, ${alpha * 0.9})`;
+            grungeCtx.lineWidth = bolt.baseWidth;
+            grungeCtx.stroke();
+
+            // 枝分かれ芯
+            grungeCtx.beginPath();
+            for (const seg of bolt.segments) {
+              if (seg.isBranch) {
+                grungeCtx.moveTo(seg.x1, seg.y1);
+                grungeCtx.lineTo(seg.x2, seg.y2);
+              }
+            }
+            grungeCtx.strokeStyle = `rgba(${CONFIG.coreColor}, ${alpha * 0.7})`;
+            grungeCtx.lineWidth = bolt.baseWidth * 0.5;
+            grungeCtx.stroke();
+
+            grungeCtx.restore();
+          }
+
+          bolt.age++;
+          if (bolt.age >= bolt.maxLife) {
+            activeBolts.splice(i, 1);
+          }
+        }
+
+        if (triggeredFlash && CONFIG.flashIntensity > 0) {
+          grungeCtx.fillStyle = `rgba(${CONFIG.glowColor}, ${CONFIG.flashIntensity})`;
+          grungeCtx.fillRect(0, 0, width, height);
+        }
+      }
+
+      function drawStaticSparks() {
+        grungeCtx.save();
+        for (let i = 0; i < CONFIG.sparkCount; i++) {
+          const x = Math.random() * width;
+          const y = Math.random() * height;
+          const opacity = 0.25 + Math.random() * 0.55;
+
+          if (Math.random() < 0.45) {
+            grungeCtx.beginPath();
+            grungeCtx.strokeStyle = `rgba(${CONFIG.coreColor}, ${opacity})`;
+            grungeCtx.lineWidth = 0.6 + Math.random() * 0.6;
+            let cx = x;
+            let cy = y;
+            grungeCtx.moveTo(cx, cy);
+            const steps = 2 + Math.floor(Math.random() * 2);
+            for (let s = 0; s < steps; s++) {
+              cx += (Math.random() - 0.5) * 20;
+              cy += (Math.random() - 0.5) * 20;
+              grungeCtx.lineTo(cx, cy);
+            }
+            grungeCtx.stroke();
+          } else {
+            grungeCtx.fillStyle = `rgba(${CONFIG.glowColor}, ${opacity})`;
+            grungeCtx.fillRect(x, y, 1.5, 1.5);
+          }
+        }
+        grungeCtx.restore();
+      }
+
+      function render(timestamp) {
+        requestAnimationFrame(render);
+
+        if (!isPlaying || width === 0 || height === 0) return;
+
+        const elapsed = timestamp - lastFrameTime;
+        if (elapsed < frameInterval) return;
+        lastFrameTime = timestamp - (elapsed % frameInterval);
+
+        grungeCtx.clearRect(0, 0, width, height);
+        drawGrain();
+        updateAndDrawLightning();
+        drawStaticSparks();
+      }
+
+      requestAnimationFrame(render);
+    })();
+  </script>
+</body>
+</html>
